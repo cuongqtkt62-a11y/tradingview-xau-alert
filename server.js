@@ -4,12 +4,12 @@ const PORT = process.env.PORT || 3000;
 
 // ============================================================
 //  STANDALONE XAU ALGO BOT — Tự quét M5, tính SMC + 4EMA, báo Telegram
-//  Nguồn dữ liệu: Binance PAXGUSDT (≈ XAU/USD)
+//  Nguồn dữ liệu: Binance Futures XAUUSDT (≈ XAU/USD — Sát giá OANDA)
 // ============================================================
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const SYMBOL = 'PAXGUSDT';
+const SYMBOL = 'XAUUSDT';
 const INTERVAL = '5m';
 const SWING_LENGTH = 7;
 const BOX_WIDTH = 7;
@@ -30,7 +30,7 @@ const STARTUP_TIME = Date.now();
 //  1. LẤY DỮ LIỆU NẾN TỪ BINANCE
 // ============================================================
 async function fetchCandles(limit = 500) {
-    const url = `https://data-api.binance.vision/api/v3/klines?symbol=${SYMBOL}&interval=${INTERVAL}&limit=${limit}`;
+    const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${SYMBOL}&interval=${INTERVAL}&limit=${limit}`;
     const res = await fetch(url);
     const data = await res.json();
     if (!Array.isArray(data)) throw new Error('Binance API error: ' + JSON.stringify(data));
@@ -259,7 +259,7 @@ function formatSignalMessage(sig, ema147, ema258, ema369) {
 
 ${emaContext}
 
-⏰ Khung: M5 | Nguồn: PAXG/USDT
+⏰ Khung: M5 | Nguồn: XAU/USDT Futures
 🕐 ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}
 
 ⚡ <i>Nhớ đặt Stoploss!</i>`;
@@ -370,7 +370,7 @@ app.listen(PORT, async () => {
     console.log(`⏰ Quét mỗi ${SCAN_INTERVAL_MS / 1000}s\n`);
 
     // Thông báo khởi động
-    await sendTelegram(`🏆 <b>XAU Algo Bot Khởi Động</b>\n\n📊 Symbol: PAXG/USDT (≈ XAU/USD)\n⏰ Khung: M5\n🔄 Quét mỗi 5 phút\n🧠 Thuật toán: SMC + 4EMA\n\n<i>Bot sẽ tự động quét và báo tín hiệu BOS!</i>`);
+    await sendTelegram(`🏆 <b>XAU Algo Bot Khởi Động</b>\n\n📊 Symbol: XAU/USDT Futures (≈ XAU/USD OANDA)\n⏰ Khung: M5\n🔄 Quét mỗi 5 phút\n🧠 Thuật toán: SMC + 4EMA\n\n<i>Bot sẽ tự động quét và báo tín hiệu BOS!</i>`);
 
     // Quét lần đầu sau 5 giây (grace period ngắn)
     setTimeout(() => {
