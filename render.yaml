@@ -14,10 +14,10 @@ services:
       - key: WEBHOOK_SECRET
         sync: false
 
-  # Cron Job ping mỗi 14 phút để chống ngủ đông (Render Free Tier)
+  # Cron Job ping mỗi 14 phút để chống ngủ đông (Render Free Tier) - Đánh thức tất cả 5 Bots
   - type: cron
-    name: ping-xau-alert
+    name: ping-all-bots
     runtime: node
     schedule: "*/14 * * * *"
     buildCommand: ""
-    startCommand: 'curl -s https://tradingview-xau-alert.onrender.com/ping || echo "Ping failed"'
+    startCommand: 'curl -s https://tradingview-xau-alert.onrender.com/ping >/dev/null && curl -s https://zalo-bots-1.onrender.com/ >/dev/null && curl -s https://zalo-bots.onrender.com/ >/dev/null && curl -s https://ceo-voice-assistant.onrender.com/ >/dev/null && curl -s https://trading-telegram-bot-ozhm.onrender.com/ >/dev/null || echo "Ping"'
