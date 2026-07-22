@@ -1,244 +1,381 @@
-// ============================================================
-// TradingView XAU/USD Alert Webhook → Telegram
-// Chạy 24/7 trên Render (Frankfurt EU)
-// ============================================================
-
 const express = require('express');
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Parse cả JSON lẫn plain text (TradingView gửi cả 2 dạng)
-app.use(express.json({ limit: '1mb' }));
-app.use(express.text({ limit: '1mb' }));
+// ============================================================
+//  STANDALONE XAU ALGO BOT — Tự quét M5, tính SMC + 4EMA, báo Telegram
+//  Nguồn dữ liệu: Binance PAXGUSDT (≈ XAU/USD)
+// ============================================================
 
-// ===================== ENV =====================
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'xau-smc-2026';
-const PORT = process.env.PORT || 10016;
+const SYMBOL = 'PAXGUSDT';
+const INTERVAL = '5m';
+const SWING_LENGTH = 7;
+const BOX_WIDTH = 7;
+const HISTORY_KEEP = 7;
+const SCAN_INTERVAL_MS = 5 * 60 * 1000; // 5 phút
 
-// ===================== STARTUP CHECK =====================
-if (!BOT_TOKEN) {
-    console.error('❌ FATAL: Thiếu TELEGRAM_BOT_TOKEN trong .env');
-    process.exit(1);
-}
-if (!CHAT_ID) {
-    console.warn('⚠️ WARNING: TELEGRAM_CHAT_ID chưa được cấu hình! Alert sẽ không gửi được.');
+// ============================================================
+//  TRẠNG THÁI TOÀN CỤC
+// ============================================================
+let supplyZones = [];
+let demandZones = [];
+let alertedBOS = new Set(); // Chống spam: mỗi BOS chỉ báo 1 lần
+let lastScanTime = null;
+let scanCount = 0;
+const STARTUP_TIME = Date.now();
+
+// ============================================================
+//  1. LẤY DỮ LIỆU NẾN TỪ BINANCE
+// ============================================================
+async function fetchCandles(limit = 500) {
+    const url = `https://data-api.binance.vision/api/v3/klines?symbol=${SYMBOL}&interval=${INTERVAL}&limit=${limit}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!Array.isArray(data)) throw new Error('Binance API error: ' + JSON.stringify(data));
+    return data.map(c => ({
+        time: c[0],
+        open: parseFloat(c[1]),
+        high: parseFloat(c[2]),
+        low: parseFloat(c[3]),
+        close: parseFloat(c[4]),
+        volume: parseFloat(c[5])
+    }));
 }
 
-// ===================== TELEGRAM SENDER =====================
+// ============================================================
+//  2. TÍNH EMA
+// ============================================================
+function calcEMA(closes, period) {
+    const k = 2 / (period + 1);
+    const ema = [closes[0]];
+    for (let i = 1; i < closes.length; i++) {
+        ema.push(closes[i] * k + ema[i - 1] * (1 - k));
+    }
+    return ema;
+}
+
+// ============================================================
+//  3. TÌM SWING HIGH / SWING LOW (PivotHigh / PivotLow)
+// ============================================================
+function findSwingHighs(highs, length) {
+    const swings = [];
+    for (let i = length; i < highs.length - length; i++) {
+        let isSwing = true;
+        for (let j = 1; j <= length; j++) {
+            if (highs[i] < highs[i - j] || highs[i] < highs[i + j]) {
+                isSwing = false;
+                break;
+            }
+        }
+        if (isSwing) swings.push({ index: i, value: highs[i] });
+    }
+    return swings;
+}
+
+function findSwingLows(lows, length) {
+    const swings = [];
+    for (let i = length; i < lows.length - length; i++) {
+        let isSwing = true;
+        for (let j = 1; j <= length; j++) {
+            if (lows[i] > lows[i - j] || lows[i] > lows[i + j]) {
+                isSwing = false;
+                break;
+            }
+        }
+        if (isSwing) swings.push({ index: i, value: lows[i] });
+    }
+    return swings;
+}
+
+// ============================================================
+//  4. TÍNH ATR (Average True Range)
+// ============================================================
+function calcATR(candles, period = 50) {
+    const trs = [];
+    for (let i = 1; i < candles.length; i++) {
+        const tr = Math.max(
+            candles[i].high - candles[i].low,
+            Math.abs(candles[i].high - candles[i - 1].close),
+            Math.abs(candles[i].low - candles[i - 1].close)
+        );
+        trs.push(tr);
+    }
+    // Simple moving average of TR for the last 'period' values
+    if (trs.length < period) return trs.reduce((a, b) => a + b, 0) / trs.length;
+    const slice = trs.slice(-period);
+    return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+// ============================================================
+//  5. XÂY DỰNG VÙNG SUPPLY / DEMAND (SMC Zones)
+// ============================================================
+function buildZones(candles, swingHighs, swingLows, atr) {
+    const atrBuffer = atr * (BOX_WIDTH / 10);
+    const supply = [];
+    const demand = [];
+
+    // Supply zones from Swing Highs
+    for (const sh of swingHighs.slice(-HISTORY_KEEP)) {
+        const top = sh.value;
+        const bottom = top - atrBuffer;
+        const poi = (top + bottom) / 2;
+        // Check overlapping
+        let overlapping = false;
+        for (const zone of supply) {
+            const zonePoi = (zone.top + zone.bottom) / 2;
+            if (Math.abs(poi - zonePoi) < atr * 2) {
+                overlapping = true;
+                break;
+            }
+        }
+        if (!overlapping) {
+            supply.push({ top, bottom, poi, index: sh.index, broken: false });
+        }
+    }
+
+    // Demand zones from Swing Lows
+    for (const sl of swingLows.slice(-HISTORY_KEEP)) {
+        const bottom = sl.value;
+        const top = bottom + atrBuffer;
+        const poi = (top + bottom) / 2;
+        let overlapping = false;
+        for (const zone of demand) {
+            const zonePoi = (zone.top + zone.bottom) / 2;
+            if (Math.abs(poi - zonePoi) < atr * 2) {
+                overlapping = true;
+                break;
+            }
+        }
+        if (!overlapping) {
+            demand.push({ top, bottom, poi, index: sl.index, broken: false });
+        }
+    }
+
+    return { supply, demand };
+}
+
+// ============================================================
+//  6. KIỂM TRA BOS (Break of Structure)
+// ============================================================
+function detectBOS(candles, supply, demand) {
+    const signals = [];
+    const currentCandle = candles[candles.length - 1];
+    const price = currentCandle.close;
+
+    // Check Supply BOS (LONG signal — price breaks above supply)
+    for (const zone of supply) {
+        if (!zone.broken && price >= zone.top) {
+            zone.broken = true;
+            const bosKey = `LONG_${zone.top.toFixed(2)}_${zone.index}`;
+            if (!alertedBOS.has(bosKey)) {
+                alertedBOS.add(bosKey);
+                signals.push({
+                    signal: 'LONG',
+                    msg: 'Giá phá vỡ BOS Supply — Canh LONG',
+                    price: price.toFixed(2),
+                    zoneTop: zone.top.toFixed(2),
+                    zoneBottom: zone.bottom.toFixed(2)
+                });
+            }
+        }
+    }
+
+    // Check Demand BOS (SHORT signal — price breaks below demand)
+    for (const zone of demand) {
+        if (!zone.broken && price <= zone.bottom) {
+            zone.broken = true;
+            const bosKey = `SHORT_${zone.bottom.toFixed(2)}_${zone.index}`;
+            if (!alertedBOS.has(bosKey)) {
+                alertedBOS.add(bosKey);
+                signals.push({
+                    signal: 'SHORT',
+                    msg: 'Giá phá vỡ BOS Demand — Canh SHORT',
+                    price: price.toFixed(2),
+                    zoneTop: zone.top.toFixed(2),
+                    zoneBottom: zone.bottom.toFixed(2)
+                });
+            }
+        }
+    }
+
+    return signals;
+}
+
+// ============================================================
+//  7. GỬI TELEGRAM
+// ============================================================
 async function sendTelegram(text) {
     if (!BOT_TOKEN || !CHAT_ID) {
-        console.error('❌ Không gửi được: Thiếu BOT_TOKEN hoặc CHAT_ID');
-        return null;
+        console.log('[TELEGRAM SKIP] Missing BOT_TOKEN or CHAT_ID');
+        return;
     }
-
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
-    const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            chat_id: CHAT_ID,
-            text: text,
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-        })
-    });
-
-    const result = await response.json();
-    if (!result.ok) {
-        console.error('❌ Telegram API error:', result.description);
-        throw new Error(`Telegram: ${result.description}`);
-    }
-    console.log('✅ Telegram message sent successfully');
-    return result;
-}
-
-// ===================== FORMAT ALERT =====================
-function formatAlert(data) {
-    const signal = (data.signal || '').toUpperCase();
-    const msgText = data.msg || data.message || '';
-
-    // Detect Long/Short từ signal hoặc nội dung tin nhắn
-    const isLong = signal === 'LONG'
-        || msgText.includes('Long')
-        || msgText.includes('BOS đỏ');
-
-    const emoji = isLong ? '🟢' : '🔴';
-    const direction = isLong ? 'LONG ▲' : 'SHORT ▼';
-    const bosType = isLong ? 'SUPPLY (Vùng Cung)' : 'DEMAND (Vùng Cầu)';
-    const action = isLong ? 'MUA' : 'BÁN';
-
-    // Thời gian Việt Nam
-    const now = new Date().toLocaleString('vi-VN', {
-        timeZone: 'Asia/Ho_Chi_Minh',
-        day: '2-digit', month: '2-digit', year: 'numeric',
-        hour: '2-digit', minute: '2-digit', second: '2-digit'
-    });
-
-    // Giá
-    const price = data.price
-        ? `$${parseFloat(data.price).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-        : 'N/A';
-
-    // Khung thời gian
-    const tf = data.tf || 'M5';
-
-    // EMA Context (nếu Pine Script gửi kèm)
-    let emaBlock = '';
-    if (data.ema147 && data.ema258 && data.ema369) {
-        const e147 = parseFloat(data.ema147).toFixed(2);
-        const e258 = parseFloat(data.ema258).toFixed(2);
-        const e369 = parseFloat(data.ema369).toFixed(2);
-
-        // Xác định xu hướng EMA
-        const isBullish = parseFloat(data.price) > parseFloat(data.ema147);
-        const trendEmoji = isBullish ? '📗' : '📕';
-        const trendText = isBullish ? 'Giá TRÊN kênh EMA → Uptrend' : 'Giá DƯỚI kênh EMA → Downtrend';
-
-        emaBlock = `
-📐 <b>EMA Context:</b>
-   ├ EMA 147: $${e147}
-   ├ EMA 258: $${e258}
-   └ EMA 369: $${e369}
-${trendEmoji} <i>${trendText}</i>`;
-    }
-
-    return `
-${emoji}${emoji}${emoji} <b>${direction} XAU/USD</b> ${emoji}${emoji}${emoji}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-
-🎯 <b>BOS ${bosType} đã bị phá vỡ!</b>
-💡 <b>Hành động:</b> Canh ${action}
-
-📊 <b>Tín hiệu:</b> ${msgText || 'BOS Alert'}
-💰 <b>Giá:</b> ${price}
-⏰ <b>Thời gian:</b> ${now}
-📈 <b>Khung:</b> ${tf}
-${emaBlock}
-━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ <b>NHỚ ĐẶT STOPLOSS NGAY!</b>
-📏 <i>Kỷ luật R:R tối thiểu 1:2</i>
-🧊 <i>"No Stop Hunt — No Trade"</i>
-`.trim();
-}
-
-// ===================== ROUTES =====================
-
-// 1. WEBHOOK CHÍNH — TradingView gửi tín hiệu tới đây
-app.post('/webhook/tradingview', async (req, res) => {
     try {
-        // Xác thực secret
-        const secret = req.query.secret;
-        if (secret !== WEBHOOK_SECRET) {
-            console.log(`⛔ Webhook rejected: invalid secret (got: ${secret})`);
-            return res.status(403).json({ error: 'Invalid secret' });
-        }
+        const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: CHAT_ID,
+                text,
+                parse_mode: 'HTML'
+            })
+        });
+        const data = await res.json();
+        if (!data.ok) console.error('[TELEGRAM ERROR]', data.description);
+    } catch (err) {
+        console.error('[TELEGRAM SEND ERROR]', err.message);
+    }
+}
 
-        // Parse payload — TradingView có thể gửi JSON hoặc plain text
-        let data;
-        if (typeof req.body === 'string') {
-            try {
-                data = JSON.parse(req.body);
-            } catch {
-                // Plain text alert (chưa cập nhật Pine Script)
-                data = { message: req.body };
+function formatSignalMessage(sig, ema147, ema258, ema369) {
+    const emoji = sig.signal === 'LONG' ? '🟢🔼' : '🔴🔽';
+    const action = sig.signal === 'LONG' ? 'CANH MUA (LONG)' : 'CANH BÁN (SHORT)';
+    
+    // Xác định vị trí giá so với EMA
+    const price = parseFloat(sig.price);
+    let emaContext = '';
+    if (price > ema147 && price > ema258 && price > ema369) {
+        emaContext = '✅ Giá trên cả 3 EMA → Xu hướng TĂNG mạnh';
+    } else if (price < ema147 && price < ema258 && price < ema369) {
+        emaContext = '⚠️ Giá dưới cả 3 EMA → Xu hướng GIẢM mạnh';
+    } else if (price > ema147) {
+        emaContext = '📊 Giá trên EMA147 → Xu hướng ngắn hạn TĂNG';
+    } else {
+        emaContext = '📊 Giá dưới EMA147 → Xu hướng ngắn hạn GIẢM';
+    }
+
+    return `${emoji} <b>TÍN HIỆU XAU/USD — ${action}</b>
+
+📌 <b>${sig.msg}</b>
+
+💰 Giá hiện tại: <b>${sig.price}</b>
+📦 Vùng bị phá: ${sig.zoneBottom} → ${sig.zoneTop}
+
+📈 EMA 147: ${ema147.toFixed(2)}
+📉 EMA 258: ${ema258.toFixed(2)}
+📊 EMA 369: ${ema369.toFixed(2)}
+
+${emaContext}
+
+⏰ Khung: M5 | Nguồn: PAXG/USDT
+🕐 ${new Date().toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}
+
+⚡ <i>Nhớ đặt Stoploss!</i>`;
+}
+
+// ============================================================
+//  8. HÀM QUÉT CHÍNH (Main Scanner)
+// ============================================================
+async function runScan() {
+    try {
+        console.log(`\n[SCAN ${++scanCount}] ${new Date().toISOString()} — Đang quét...`);
+
+        // 1. Kéo 500 nến M5
+        const candles = await fetchCandles(500);
+        console.log(`  → Lấy được ${candles.length} nến M5`);
+
+        const closes = candles.map(c => c.close);
+        const highs = candles.map(c => c.high);
+        const lows = candles.map(c => c.low);
+
+        // 2. Tính 3 đường EMA
+        const ema147 = calcEMA(closes, 147);
+        const ema258 = calcEMA(closes, 258);
+        const ema369 = calcEMA(closes, 369);
+
+        const currentEMA147 = ema147[ema147.length - 1];
+        const currentEMA258 = ema258[ema258.length - 1];
+        const currentEMA369 = ema369[ema369.length - 1];
+
+        console.log(`  → EMA147: ${currentEMA147.toFixed(2)} | EMA258: ${currentEMA258.toFixed(2)} | EMA369: ${currentEMA369.toFixed(2)}`);
+
+        // 3. Tìm Swing High/Low
+        const swingHighs = findSwingHighs(highs, SWING_LENGTH);
+        const swingLows = findSwingLows(lows, SWING_LENGTH);
+        console.log(`  → Swing Highs: ${swingHighs.length} | Swing Lows: ${swingLows.length}`);
+
+        // 4. Tính ATR
+        const atr = calcATR(candles, 50);
+        console.log(`  → ATR(50): ${atr.toFixed(2)}`);
+
+        // 5. Xây vùng Supply/Demand
+        const { supply, demand } = buildZones(candles, swingHighs, swingLows, atr);
+        supplyZones = supply;
+        demandZones = demand;
+        console.log(`  → Supply Zones: ${supply.length} | Demand Zones: ${demand.length}`);
+
+        // 6. Kiểm tra BOS
+        const signals = detectBOS(candles, supply, demand);
+
+        if (signals.length > 0) {
+            console.log(`  🚨 PHÁT HIỆN ${signals.length} TÍN HIỆU BOS!`);
+            for (const sig of signals) {
+                const msg = formatSignalMessage(sig, currentEMA147, currentEMA258, currentEMA369);
+                await sendTelegram(msg);
+                console.log(`  → Đã gửi Telegram: ${sig.signal} @ ${sig.price}`);
             }
-        } else if (typeof req.body === 'object' && req.body !== null) {
-            data = req.body;
         } else {
-            data = { message: 'Unknown alert' };
+            console.log(`  ✅ Không có tín hiệu BOS mới.`);
         }
 
-        console.log('📥 Webhook received:', JSON.stringify(data));
+        lastScanTime = new Date().toISOString();
+        console.log(`  → Giá hiện tại: ${closes[closes.length - 1].toFixed(2)}`);
 
-        // Format và gửi Telegram
-        const message = formatAlert(data);
-        await sendTelegram(message);
-
-        res.json({ ok: true, sent: true });
+        // Dọn dẹp alertedBOS cũ (giữ 100 entry gần nhất)
+        if (alertedBOS.size > 100) {
+            const arr = Array.from(alertedBOS);
+            alertedBOS = new Set(arr.slice(-50));
+        }
 
     } catch (err) {
-        console.error('❌ Webhook processing error:', err.message);
-
-        // Vẫn trả 200 để TradingView không retry liên tục
-        res.status(200).json({ ok: false, error: err.message });
+        console.error('[SCAN ERROR]', err.message);
     }
-});
+}
 
-// 2. HEALTH CHECK
-app.get('/', (req, res) => {
+// ============================================================
+//  9. EXPRESS SERVER (Keep-alive endpoint)
+// ============================================================
+app.get('/ping', (req, res) => {
     res.json({
-        status: '🟢 Running',
-        service: 'TradingView XAU Alert → Telegram',
-        uptime: `${Math.floor(process.uptime())}s`,
-        chatId: CHAT_ID ? '✅ Configured' : '❌ Missing',
-        timestamp: new Date().toISOString()
+        status: 'alive',
+        bot: 'XAU Algo Bot',
+        lastScan: lastScanTime,
+        scanCount,
+        supplyZones: supplyZones.length,
+        demandZones: demandZones.length,
+        uptime: Math.floor((Date.now() - STARTUP_TIME) / 1000) + 's'
     });
 });
 
-// 3. PING — Cho Cron Job keep-alive
-app.get('/ping', (req, res) => {
-    console.log(`🏓 Ping received at ${new Date().toISOString()}`);
-    res.send('pong');
+app.get('/', (req, res) => {
+    res.send(`
+        <h1>🏆 XAU Algo Bot — Đang Hoạt Động</h1>
+        <p>Quét nến M5 mỗi 5 phút | Phát hiện BOS → Báo Telegram</p>
+        <p>Lần quét cuối: ${lastScanTime || 'Chưa quét'}</p>
+        <p>Tổng lần quét: ${scanCount}</p>
+        <p>Supply Zones: ${supplyZones.length} | Demand Zones: ${demandZones.length}</p>
+    `);
 });
 
-// 4. TEST ALERT — Gửi cảnh báo thử
-app.get('/test-alert', async (req, res) => {
-    try {
-        const testData = {
-            signal: 'LONG',
-            msg: '🧪 TEST — Giá qua khỏi BOS đỏ, Long Nào',
-            price: '3245.50',
-            tf: 'M5',
-            ema147: '3240.00',
-            ema258: '3220.00',
-            ema369: '3200.00'
-        };
+// ============================================================
+//  10. KHỞI ĐỘNG
+// ============================================================
+app.listen(PORT, async () => {
+    console.log(`\n🏆 XAU ALGO BOT — Server khởi động trên cổng ${PORT}`);
+    console.log(`📊 Symbol: ${SYMBOL} | Interval: ${INTERVAL}`);
+    console.log(`🔔 Telegram Bot: ${BOT_TOKEN ? 'Đã cấu hình' : '❌ THIẾU'}`);
+    console.log(`📡 Chat ID: ${CHAT_ID ? 'Đã cấu hình' : '❌ THIẾU'}`);
+    console.log(`⏰ Quét mỗi ${SCAN_INTERVAL_MS / 1000}s\n`);
 
-        const message = formatAlert(testData);
-        await sendTelegram(message);
-        res.json({ ok: true, message: 'Test alert đã gửi lên Telegram!' });
+    // Thông báo khởi động
+    await sendTelegram(`🏆 <b>XAU Algo Bot Khởi Động</b>\n\n📊 Symbol: PAXG/USDT (≈ XAU/USD)\n⏰ Khung: M5\n🔄 Quét mỗi 5 phút\n🧠 Thuật toán: SMC + 4EMA\n\n<i>Bot sẽ tự động quét và báo tín hiệu BOS!</i>`);
 
-    } catch (err) {
-        res.status(500).json({ ok: false, error: err.message });
-    }
-});
-
-// 5. TEST SHORT ALERT
-app.get('/test-short', async (req, res) => {
-    try {
-        const testData = {
-            signal: 'SHORT',
-            msg: '🧪 TEST — Giá qua khỏi BOS xanh, Short Nào',
-            price: '3280.75',
-            tf: 'M5',
-            ema147: '3260.00',
-            ema258: '3240.00',
-            ema369: '3220.00'
-        };
-
-        const message = formatAlert(testData);
-        await sendTelegram(message);
-        res.json({ ok: true, message: 'Test SHORT alert đã gửi lên Telegram!' });
-
-    } catch (err) {
-        res.status(500).json({ ok: false, error: err.message });
-    }
-});
-
-// ===================== START SERVER =====================
-app.listen(PORT, '0.0.0.0', () => {
-    console.log('');
-    console.log('╔══════════════════════════════════════════════╗');
-    console.log('║  🏆 TradingView XAU Alert Server Started!   ║');
-    console.log('╠══════════════════════════════════════════════╣');
-    console.log(`║  Port: ${PORT}                                ║`);
-    console.log(`║  Webhook: POST /webhook/tradingview          ║`);
-    console.log(`║  Test:    GET  /test-alert                   ║`);
-    console.log(`║  Health:  GET  /                             ║`);
-    console.log('╚══════════════════════════════════════════════╝');
-    console.log('');
-    console.log(`📡 Webhook Secret: ${WEBHOOK_SECRET}`);
-    console.log(`💬 Chat ID: ${CHAT_ID || '❌ CHƯA CẤU HÌNH'}`);
-    console.log('');
+    // Quét lần đầu sau 5 giây (grace period ngắn)
+    setTimeout(() => {
+        runScan();
+        // Sau đó lặp lại mỗi 5 phút
+        setInterval(runScan, SCAN_INTERVAL_MS);
+    }, 5000);
 });
