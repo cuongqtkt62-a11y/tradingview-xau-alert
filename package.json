@@ -1,0 +1,14 @@
+{
+  "name": "tradingview-xau-alert",
+  "version": "1.0.0",
+  "description": "TradingView XAU/USD SMC+4EMA Alert → Telegram Webhook Server (24/7 trên Render)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "author": "Antigravity",
+  "license": "ISC"
+}

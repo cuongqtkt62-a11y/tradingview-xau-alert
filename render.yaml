@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: tradingview-xau-alert
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    # Deploy ở Frankfurt EU để tránh lỗi Telegram IP blocked
+    # Region: chọn Frankfurt khi tạo service trên Render
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+
+  # Cron Job ping mỗi 14 phút để chống ngủ đông (Render Free Tier)
+  - type: cron
+    name: ping-xau-alert
+    runtime: node
+    schedule: "*/14 * * * *"
+    buildCommand: ""
+    startCommand: 'curl -s https://tradingview-xau-alert.onrender.com/ping || echo "Ping failed"'
